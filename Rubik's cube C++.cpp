@@ -15,6 +15,9 @@
 #include <cstring>
 #include <cctype>
 #include <array>
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
 
 // --- Constants ---
 #define PI 3.14159265358979323846
@@ -66,7 +69,6 @@ int rotationAxis = -1; // 0=X, 1=Y, 2=Z
 int rotatingIndex = -1; // Which slice
 bool turningClockwise = true;
 bool turningWholeCube = false;
-
 // Camera
 float xRotationKey = 25.0f * DEGTORAD;
 float yRotationKey = -45.0f * DEGTORAD;
@@ -259,6 +261,204 @@ char colorToFaceLetter(const Color& c) {
     return '?';
 }
 
+
+struct StickerRef { int x, y, z, nx, ny, nz; };
+
+class IDAStarSolver {
+public:
+    IDAStarSolver() {
+        if (!inited) init();
+    }
+
+    bool solve(const std::string& facelets, std::string& outAlg, int maxDepth = 22, int timeoutMs = 6000) {
+        if (facelets == solved()) { outAlg.clear(); return true; }
+        startTime = std::chrono::steady_clock::now();
+        timeout = timeoutMs;
+
+        std::array<char, 54> state;
+        for (int i = 0; i < 54; ++i) state[i] = facelets[i];
+
+        int bound = heuristic(state);
+        std::vector<int> path;
+        while (bound <= maxDepth) {
+            seenDepth.clear();
+            int t = dfs(state, 0, bound, -1, path);
+            if (t == FOUND) {
+                outAlg = formatPath(path);
+                return true;
+            }
+            if (t == TIMEOUT || t > maxDepth) return false;
+            bound = t;
+        }
+        return false;
+    }
+
+    static const std::string& solved() {
+        static const std::string s = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB";
+        return s;
+    }
+
+private:
+    static const int FOUND = -1;
+    static const int TIMEOUT = -2;
+
+    static bool inited;
+    static int perm[18][54];
+    static StickerRef idxToSticker[54];
+
+    std::chrono::steady_clock::time_point startTime;
+    int timeout = 0;
+    std::unordered_map<std::string, int> seenDepth;
+
+    static int faceOfMove(int mv) { return mv / 3; }
+    static int oppositeFace(int f) {
+        if (f == 0) return 3; if (f == 3) return 0;
+        if (f == 1) return 4; if (f == 4) return 1;
+        return (f == 2) ? 5 : 2;
+    }
+
+    bool timedOut() const {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count();
+        return (int)ms >= timeout;
+    }
+
+    int heuristic(const std::array<char, 54>& st) const {
+        int misplaced = 0;
+        const std::string& goal = solved();
+        for (int i = 0; i < 54; ++i) {
+            if (i == 4 || i == 13 || i == 22 || i == 31 || i == 40 || i == 49) continue;
+            if (st[i] != goal[i]) misplaced++;
+        }
+        return (misplaced + 7) / 8;
+    }
+
+    void applyMove(std::array<char, 54>& st, int mv) const {
+        std::array<char, 54> prev = st;
+        for (int i = 0; i < 54; ++i) st[i] = prev[perm[mv][i]];
+    }
+
+    int dfs(std::array<char, 54>& st, int g, int bound, int prevMove, std::vector<int>& path) {
+        if (timedOut()) return TIMEOUT;
+        int h = heuristic(st);
+        int f = g + h;
+        if (f > bound) return f;
+        if (h == 0 && std::string(st.begin(), st.end()) == solved()) return FOUND;
+
+        std::string key(st.begin(), st.end());
+        std::unordered_map<std::string, int>::const_iterator it = seenDepth.find(key);
+        if (it != seenDepth.end() && it->second <= g) return 1000000;
+        seenDepth[key] = g;
+
+        int minNext = 1e9;
+        int prevFace = (prevMove == -1) ? -1 : faceOfMove(prevMove);
+
+        for (int mv = 0; mv < 18; ++mv) {
+            int face = faceOfMove(mv);
+            if (face == prevFace) continue;
+            if (prevFace != -1 && oppositeFace(face) == prevFace && face < prevFace) continue;
+
+            path.push_back(mv);
+            auto backup = st;
+            applyMove(st, mv);
+            int t = dfs(st, g + 1, bound, mv, path);
+            if (t == FOUND) return FOUND;
+            if (t == TIMEOUT) return TIMEOUT;
+            if (t < minNext) minNext = t;
+            st = backup;
+            path.pop_back();
+        }
+        return minNext;
+    }
+
+    std::string formatPath(const std::vector<int>& path) const {
+        static const char faces[6] = { 'U', 'R', 'F', 'D', 'L', 'B' };
+        std::string out;
+        for (size_t i = 0; i < path.size(); ++i) {
+            int face = path[i] / 3;
+            int pow = path[i] % 3;
+            if (!out.empty()) out.push_back(' ');
+            out.push_back(faces[face]);
+            if (pow == 1) out.push_back('2');
+            else if (pow == 2) out.push_back('\'');
+        }
+        return out;
+    }
+
+    static int findIndex(const StickerRef& s) {
+        for (int i = 0; i < 54; ++i) {
+            const StickerRef& t = idxToSticker[i];
+            if (t.x == s.x && t.y == s.y && t.z == s.z && t.nx == s.nx && t.ny == s.ny && t.nz == s.nz) return i;
+        }
+        return -1;
+    }
+
+    static void rotateX(StickerRef& s, int dir) {
+        int y = s.y, z = s.z;
+        int ny = s.ny, nz = s.nz;
+        if (dir > 0) { s.y = -z; s.z = y; s.ny = -nz; s.nz = ny; }
+        else { s.y = z; s.z = -y; s.ny = nz; s.nz = -ny; }
+    }
+    static void rotateY(StickerRef& s, int dir) {
+        int x = s.x, z = s.z;
+        int nx = s.nx, nz = s.nz;
+        if (dir > 0) { s.x = z; s.z = -x; s.nx = nz; s.nz = -nx; }
+        else { s.x = -z; s.z = x; s.nx = -nz; s.nz = nx; }
+    }
+    static void rotateZ(StickerRef& s, int dir) {
+        int x = s.x, y = s.y;
+        int nx = s.nx, ny = s.ny;
+        if (dir > 0) { s.x = -y; s.y = x; s.nx = -ny; s.ny = nx; }
+        else { s.x = y; s.y = -x; s.nx = ny; s.ny = -nx; }
+    }
+
+    static void applyBase(StickerRef& s, int face) {
+        // face order: U,R,F,D,L,B
+        if (face == 0 && s.y == 1) rotateY(s, +1);
+        if (face == 1 && s.x == 1) rotateX(s, +1);
+        if (face == 2 && s.z == 1) rotateZ(s, +1);
+        if (face == 3 && s.y == -1) rotateY(s, -1);
+        if (face == 4 && s.x == -1) rotateX(s, -1);
+        if (face == 5 && s.z == -1) rotateZ(s, -1);
+    }
+
+    static void initStickers() {
+        int idx = 0;
+        for (int z = -1; z <= 1; ++z) for (int x = -1; x <= 1; ++x) idxToSticker[idx++] = { x, 1, z, 0, 1, 0 }; // U
+        for (int y = 1; y >= -1; --y) for (int z = 1; z >= -1; --z) idxToSticker[idx++] = { 1, y, z, 1, 0, 0 }; // R
+        for (int y = 1; y >= -1; --y) for (int x = -1; x <= 1; ++x) idxToSticker[idx++] = { x, y, 1, 0, 0, 1 }; // F
+        for (int z = 1; z >= -1; --z) for (int x = -1; x <= 1; ++x) idxToSticker[idx++] = { x, -1, z, 0, -1, 0 }; // D
+        for (int y = 1; y >= -1; --y) for (int z = -1; z <= 1; ++z) idxToSticker[idx++] = { -1, y, z, -1, 0, 0 }; // L
+        for (int y = 1; y >= -1; --y) for (int x = 1; x >= -1; --x) idxToSticker[idx++] = { x, y, -1, 0, 0, -1 }; // B
+    }
+
+    static void init() {
+        initStickers();
+        for (int face = 0; face < 6; ++face) {
+            int mvQuarter = face * 3;
+            int mvHalf = mvQuarter + 1;
+            int mvPrime = mvQuarter + 2;
+            for (int i = 0; i < 54; ++i) {
+                StickerRef a = idxToSticker[i];
+                applyBase(a, face);
+                perm[mvQuarter][findIndex(a)] = i;
+
+                StickerRef b = a;
+                applyBase(b, face);
+                perm[mvHalf][findIndex(b)] = i;
+
+                StickerRef c = b;
+                applyBase(c, face);
+                perm[mvPrime][findIndex(c)] = i;
+            }
+        }
+        inited = true;
+    }
+};
+
+bool IDAStarSolver::inited = false;
+int IDAStarSolver::perm[18][54] = { 0 };
+StickerRef IDAStarSolver::idxToSticker[54];
+
 // --- Cube Class ---
 class Cube {
 public:
@@ -358,13 +558,19 @@ public:
             printf("Solver failed: %s\n", solution.c_str());
             return false;
         }
-        printf("Solver: %s\n", solution.c_str());
+        printf("Solver (Kociemba): %s\n", solution.c_str());
         queueAlgorithm(solution);
         return true;
 #else
-        printf("Solver not compiled in. Add Search.h/Search.cpp (min2phase/Kociemba) and compile with -DUSE_MIN2PHASE\n");
-        printf("Facelets: %s\n", facelets.c_str());
-        return false;
+        IDAStarSolver solver;
+        std::string solution;
+        if (!solver.solve(facelets, solution, 22, 15000)) {
+            printf("Solver failed (IDA* timeout/depth).\n");
+            return false;
+        }
+        printf("Solver (IDA*): %s\n", solution.c_str());
+        queueAlgorithm(solution);
+        return true;
 #endif
     }
 
@@ -670,7 +876,20 @@ void DrawScene() {
     glPrint(10, 24, "FPS: %d", currentFPS);
     glPrint(10, 48, "Space: Scramble | Ctrl+P: Reset");
     glPrint(10, 72, "Keys: U D L R F B X Y Z (Shift = prime)");
-    glPrint(10, 96, "T: Self-tests");
+    glPrint(10, 96, "S: Solve | T: Self-tests");
+}
+
+
+
+bool SetupBestPixelFormatWithMSAA(HDC hdc) {
+    PIXELFORMATDESCRIPTOR pfd = { sizeof(PIXELFORMATDESCRIPTOR), 1,
+        PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        PFD_TYPE_RGBA, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, PFD_MAIN_PLANE, 0, 0, 0, 0 };
+
+    int format = ChoosePixelFormat(hdc, &pfd);
+    if (format <= 0) return false;
+    if (!SetPixelFormat(hdc, format, &pfd)) return false;
+    return true;
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -681,9 +900,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     HWND hwnd = CreateWindowEx(0, "CubeApp", "Rubik's Cube C++", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 800, 600, NULL, NULL, hInstance, NULL);
 
     HDC hdc = GetDC(hwnd);
-    PIXELFORMATDESCRIPTOR pfd = { sizeof(PIXELFORMATDESCRIPTOR), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, PFD_MAIN_PLANE, 0, 0, 0, 0 };
-    int format = ChoosePixelFormat(hdc, &pfd);
-    SetPixelFormat(hdc, format, &pfd);
+    if (!SetupBestPixelFormatWithMSAA(hdc)) {
+        MessageBox(hwnd, "Failed to setup OpenGL pixel format", "Error", MB_OK | MB_ICONERROR);
+        return -1;
+    }
+
     HGLRC hrc = wglCreateContext(hdc);
     wglMakeCurrent(hdc, hrc);
 
@@ -691,6 +912,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_NORMALIZE);
+    glEnable(GL_MULTISAMPLE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_FASTEST);
+    glEnable(GL_POLYGON_SMOOTH);
+    glHint(GL_POLYGON_SMOOTH_HINT, GL_FASTEST);
     glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
 
     glEnable(GL_LIGHTING);
